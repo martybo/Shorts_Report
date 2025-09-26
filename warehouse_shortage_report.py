@@ -347,6 +347,7 @@ def main():
         window_id = np.zeros(len(df), dtype=int)
         window_seq = np.zeros(len(df), dtype=int)
         dedup_req_attributed = np.zeros(len(df), dtype=float)  # used for WH attribution
+        dedup_req_attributed_all = np.zeros(len(df), dtype=float)  # NEW: ALL orderlists attribution
         window_max_req_echo = np.zeros(len(df), dtype=float)
         denom_key_dep = np.empty(len(df), dtype=object)
         denom_key_sup = np.empty(len(df), dtype=object)
@@ -379,14 +380,13 @@ def main():
             return st
 
         def push_window_all(key, st, final_row_idx=None):
-            """Close ALL-routes window; add to ALL orderlist denominator (product match not required)."""
             if not st: return st
             w = st["window_max_req"]
             if w > 0 and st["last_ord"] is not None:
-                # attribute to a row (for transparency) and add to denom
                 idx_attr = final_row_idx if final_row_idx is not None else st.get("last_row_idx")
                 if idx_attr is not None:
                     denom_key_orderlist_all[idx_attr] = st["last_ord"]
+                    dedup_req_attributed_all[idx_attr] = w           # <-- NEW: store amount for ALL path
                 denom_ord_all[st["last_ord"]] += w
             st["window_max_req"] = 0.0
             st["open"] = False
@@ -507,7 +507,7 @@ def main():
         denom_grp = denom_from_keys(df["denom_key_group"],      df["dedup_req_attributed"])
 
         # ALL routes denominators (use ALL orderlist key attribution)
-        denom_ord_all = denom_from_keys(df["denom_key_orderlist_all"], df["dedup_req_attributed"])
+        denom_ord_all = denom_from_keys(df["denom_key_orderlist_all"], dedup_req_attributed_all)
 
         # ---------- rollups ----------
         def rollup(mask, series, title, qty_col, denom_map):
