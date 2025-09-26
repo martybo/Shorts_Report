@@ -285,8 +285,11 @@ def main():
                 orders_keys = _make_key(merged[ord_desc_col], merged[ord_pack_col])
         
             # Heuristic: warehouse system sets Order Qty = 0 for substituted lines.
-            # We match keys *and* require Order Qty == 0 to be safe.
-            is_sub = orders_keys.isin(subs_key_set) & (merged[oc["ord"]] == 0)
+            # We match keys *and* require the numeric Order Qty == 0 to be safe.  Using
+            # the normalised `_Ord` column avoids KeyError when the raw column is
+            # absent and keeps the comparison in numeric space.
+            ord_qty = merged["_Ord"].fillna(0)
+            is_sub = orders_keys.isin(subs_key_set) & (ord_qty == 0)
         
         merged["_IsSubstituted"] = is_sub
 
