@@ -42,8 +42,8 @@ CANDIDATES = {
     "ord":         ["Warehouse Reply Quantity","Order Qty","Ordered Qty","Reply Qty"],
     "delv":        ["Store Received Quantity","Deliver Qty","Delivered Qty","Received Qty"],
     # product/desc info
-    "desc":        ["productName","Description","Product Description","Item Description"],
-    "pack":        ["packSize","Pack Size"],
+    "desc":        ["productName","Description","Product Description","Item Description","Product Name"],
+    "pack":        ["packSize","Pack Size","Pack"],
 }
 
 CURRENCY_COLUMNS = {"lineValue","cost","unitCost","NIV","Spend","Web Spend","Miscompliant Spend"}
