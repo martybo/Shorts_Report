@@ -227,34 +227,67 @@ def main():
         else:
             merged["doNotStockReason_Final"] = product_dns
 
-        # ---------------- substitutions: by ProductName+PackSize ----------------
+        # ---------------- substitutions: by ProductName+PackSize (robust) ----------------
+        import unicodedata
+        
+        def _norm_text(series: pd.Series) -> pd.Series:
+            # Unicode normalize, strip, collapse whitespace, lowercase
+            s = series.astype("string").fillna("")
+            s = s.map(lambda x: unicodedata.normalize("NFKC", x))
+            s = s.str.strip()
+            s = s.str.replace(r"\s+", " ", regex=True)
+            s = s.str.lower()
+            return s
+        
+        def _norm_pack(series: pd.Series) -> pd.Series:
+            # Try to coerce pure numerics to integer-like strings (20.0 -> "20"); else fall back to text normalisation
+            raw = series.astype("string")
+            # Attempt numeric parse (handles "20", "20.0"); leave non-numeric as NaN
+            num = pd.to_numeric(raw.str.replace(",", "").str.extract(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*$", expand=False), errors="coerce")
+            num_str = num.map(lambda v: (f"{int(v)}" if pd.notna(v) and abs(v - int(v)) < 1e-9 else (f"{v:.3f}".rstrip("0").rstrip(".") if pd.notna(v) else np.nan)))
+            out = num_str.astype("string")
+            # Where numeric coercion failed, normalise as text
+            mask_non = out.isna() | (out.str.strip() == "nan")
+            out = out.where(~mask_non, _norm_text(raw))
+            # Final tidy
+            out = out.fillna("").str.strip()
+            return out
+        
+        def _make_key(desc_ser: pd.Series, pack_ser: pd.Series) -> pd.Series:
+            return _norm_text(desc_ser) + " | " + _norm_pack(pack_ser)
+        
         is_sub = pd.Series(False, index=merged.index)
+        subs_key_set = set()
+        
         if subs_df is not None and not subs_df.empty:
-            # subs columns
+            # Column detection for substitutions
             subs_desc_col = args.subs_desc_col or find_col(subs_df, CANDIDATES["desc"]) or subs_df.columns[0]
             subs_pack_col = args.subs_pack_col or find_col(subs_df, CANDIDATES["pack"])
             if not subs_pack_col:
                 subs_df["_blank_pack"] = ""
                 subs_pack_col = "_blank_pack"
-
-            subs_key_set = set(concat_key(subs_df[subs_desc_col], subs_df[subs_pack_col]).unique())
-
-            # orders side: prefer product description/pack from join; fallback to orders-side
+        
+            # Build the canonical key set from substitutions
+            subs_keys = _make_key(subs_df[subs_desc_col], subs_df[subs_pack_col])
+            subs_key_set = set(subs_keys.unique())
+        
+            # Build Orders-side keys:
+            # Prefer product description/packSize from the joined product table; else fall back to orders-side fields.
             desc_prod_col = prod_desc if (prod_desc and prod_desc in merged.columns) else None
             pack_prod_col = prod_pack if (prod_pack and prod_pack in merged.columns) else None
             if desc_prod_col and pack_prod_col:
-                orders_key = concat_key(merged[desc_prod_col], merged[pack_prod_col])
+                orders_keys = _make_key(merged[desc_prod_col], merged[pack_prod_col])
             else:
                 ord_desc_col = find_col(merged, CANDIDATES["desc"]) or "_blank_desc"
                 if ord_desc_col == "_blank_desc": merged["_blank_desc"] = ""
                 ord_pack_col = find_col(merged, CANDIDATES["pack"]) or "_blank_pack2"
                 if ord_pack_col == "_blank_pack2": merged["_blank_pack2"] = ""
-                orders_key = concat_key(merged[ord_desc_col], merged[ord_pack_col])
-
+                orders_keys = _make_key(merged[ord_desc_col], merged[ord_pack_col])
+        
             # Heuristic: warehouse system sets Order Qty = 0 for substituted lines.
-            order_qty = merged["_Ord"] if "_Ord" in merged.columns else pd.Series(0, index=merged.index)
-            is_sub = orders_key.isin(subs_key_set) & (order_qty == 0)
-
+            # We match keys *and* require Order Qty == 0 to be safe.
+            is_sub = orders_keys.isin(subs_key_set) & (merged[oc["ord"]] == 0)
+        
         merged["_IsSubstituted"] = is_sub
 
         # ---------------- masks ----------------
