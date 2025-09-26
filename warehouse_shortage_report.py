@@ -252,7 +252,8 @@ def main():
                 orders_key = concat_key(merged[ord_desc_col], merged[ord_pack_col])
 
             # Heuristic: warehouse system sets Order Qty = 0 for substituted lines.
-            is_sub = orders_key.isin(subs_key_set) & (merged[oc["ord"]] == 0)
+            order_qty = merged["_Ord"] if "_Ord" in merged.columns else pd.Series(0, index=merged.index)
+            is_sub = orders_key.isin(subs_key_set) & (order_qty == 0)
 
         merged["_IsSubstituted"] = is_sub
 
@@ -516,8 +517,12 @@ def main():
         }])
 
         # mismatch detail/summary
-        _ord2 = ensure_numeric(df[oc["ord"]]); _del2 = ensure_numeric(df[oc["delv"]])
-        mis_mask = (_ord2 != _del2)
+        if oc["ord"] and oc["delv"]:
+            _ord2 = ensure_numeric(df[oc["ord"]])
+            _del2 = ensure_numeric(df[oc["delv"]])
+            mis_mask = (_ord2 != _del2)
+        else:
+            mis_mask = pd.Series(False, index=df.index)
         cols_keep = [c for c in [oc["pipcode"], oc["department"], oc["branch"], oc["req"], oc["ord"], oc["delv"], oc["completed"]] if c]
         mis_detail = df.loc[mis_mask, cols_keep] if cols_keep else df.loc[mis_mask]
         if oc["pipcode"] and oc["department"] and oc["branch"]:
@@ -552,8 +557,6 @@ def main():
             "final_true_short_lines_ALL": int((df["TrueShortQty_ALL"]>0).sum()),
             "final_true_short_qty_ALL": float(df["TrueShortQty_ALL"].sum()),
         }
-        diag_df = pd.DataFrame([{"metric": k, "value": v} for k,v in diag.items()])
-
         # Top Short Lines (WH-only, matched, not substituted)
         mask_top = (roll_mask_wh.to_numpy()) & (df["TrueShortQty_WH"] > 0)
         cols = [
