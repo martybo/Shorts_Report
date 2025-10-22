@@ -146,7 +146,7 @@ def main():
         help="Semicolon-separated list of orderlist names treated as Warehouse (case-insensitive)."
     )
 
-    # NC orderlists filter (your new requirement)
+    # NC orderlists filter (your requirement)
     ap.add_argument(
         "--nc-orderlists",
         default="Supplier;Testers Perfume;Warehouse;Warehouse - CD Products;Xmas Warehouse;Perfumes;AAH (H&B);PHOENIX;YANKEE",
@@ -459,59 +459,65 @@ def main():
         df["_IsSubstituted"] = sub_sorted.to_numpy()
         df["_Effective_Delivery_Used"] = df["_EffDel"]
 
-        # roll masks
-        roll_mask_wh  = (~df["_IsSubstituted"]) & (wh_sorted & prodmatch_sort)  # WH-only & matched & not subbed
-        roll_mask_all = (~df["_IsSubstituted"])                                  # ALL routes & not subbed
-
-        # ---------- Build denominators from attributed rows ----------
+        # ------------------- FREEZE roll frames BEFORE NC -------------------
         def denom_from_keys(series_key, values):
             tmp = pd.DataFrame({"k": series_key, "v": values})
             out = tmp.groupby("k", dropna=False)["v"].sum().reset_index()
             out = out.rename(columns={"k":"key","v":"dedup_req_qty"})
             return dict(zip(out["key"], out["dedup_req_qty"]))
 
-        # WH-only denominators (use dedup_req_attributed and WH keys)
-        denom_dep = denom_from_keys(df["denom_key_department"], df["dedup_req_attributed"])
-        denom_sup = denom_from_keys(df["denom_key_supplier"],   df["dedup_req_attributed"])
-        denom_grp = denom_from_keys(df["denom_key_group"],      df["dedup_req_attributed"])
+        # Frozen frames (cannot be affected by NC filtering later)
+        df_roll_wh  = df.loc[((~df["_IsSubstituted"]) & (wh_sorted & prodmatch_sort)).to_numpy()].copy()
+        df_roll_all = df.loc[(~df["_IsSubstituted"]).to_numpy()].copy()
 
-        # ALL routes denominators (use ALL orderlist per-row attributions)
-        denom_ord_all = denom_from_keys(df["denom_key_orderlist_all"], df["dedup_req_attributed_all"])
+        # Frozen denominators
+        denom_dep_map            = denom_from_keys(df["denom_key_department"],       df["dedup_req_attributed"])
+        denom_sup_map            = denom_from_keys(df["denom_key_supplier"],         df["dedup_req_attributed"])
+        denom_grp_map            = denom_from_keys(df["denom_key_group"],            df["dedup_req_attributed"])
+        denom_orderlist_map_all  = denom_from_keys(df["denom_key_orderlist_all"],    df["dedup_req_attributed_all"])
 
-        # ---------- rollups ----------
-        def rollup(mask, series, title, qty_col, denom_map):
-            cols = [title, "true_short_qty", "true_short_lines", "dedup_req_qty",
-                    "true_short_qty_pct", "shortage_rate_pct"]
-            if series is None: return pd.DataFrame(columns=cols)
-            key_series = series.rename(title)
+        # ------------------- rollups USING FROZEN FRAMES -------------------
+        def rollup_from_frame(frame, key_col, title, qty_col, denom_map):
+            # Ensure key column exists with proper title
+            if title not in frame.columns:
+                frame = frame.rename(columns={key_col: title}) if key_col in frame.columns else frame.assign(**{title: frame[key_col] if key_col in frame.columns else pd.NA})
             g = (
-                df.loc[mask.to_numpy()]
-                  .groupby(key_series, dropna=False)
-                  .agg(
-                      true_short_qty=(qty_col,"sum"),
-                      true_short_lines=(qty_col, lambda s: (s>0).sum())
-                  )
-                  .reset_index()
+                frame.groupby(title, dropna=False)
+                     .agg(true_short_qty=(qty_col, "sum"),
+                          true_short_lines=(qty_col, lambda s: (s>0).sum()))
+                     .reset_index()
             )
             dd = pd.DataFrame([(k, v) for k, v in denom_map.items()],
                               columns=[title, "dedup_req_qty"])
             g = g.merge(dd, on=title, how="left")
             g["dedup_req_qty"] = g["dedup_req_qty"].fillna(0).astype(float)
             g = add_share_and_rate(g, "true_short_qty", "dedup_req_qty")
-            return g.sort_values(by=["true_short_qty","true_short_lines"], ascending=False)
+            return g.sort_values(by=["true_short_qty", "true_short_lines"], ascending=False)
 
-        # warehouse-only summaries (exclude non-matched PIPs)
-        r_dep = rollup(roll_mask_wh,  df["Department_Final"],   "Department",   "TrueShortQty_WH",  denom_dep)
-        r_sup = rollup(roll_mask_wh,  df["SupplierName_Final"], "SupplierName", "TrueShortQty_WH",  denom_sup)
-        r_grp = rollup(roll_mask_wh,  df["Group_Final"],        "Group",        "TrueShortQty_WH",  denom_grp)
+        # Warehouse-only summaries (frozen)
+        r_dep = rollup_from_frame(
+            df_roll_wh.assign(Department=df_roll_wh["Department_Final"]),
+            "Department", "Department", "TrueShortQty_WH", denom_dep_map
+        )
+        r_sup = rollup_from_frame(
+            df_roll_wh.assign(SupplierName=df_roll_wh["SupplierName_Final"]),
+            "SupplierName", "SupplierName", "TrueShortQty_WH", denom_sup_map
+        )
+        r_grp = rollup_from_frame(
+            df_roll_wh.assign(Group=df_roll_wh["Group_Final"]),
+            "Group", "Group", "TrueShortQty_WH", denom_grp_map
+        )
 
-        # Orderlist (ALL routes)
-        r_ord = rollup(roll_mask_all, df["Orderlist_Final"], "Orderlist", "TrueShortQty_ALL", denom_ord_all)
+        # Orderlist (ALL routes, frozen)
+        r_ord = rollup_from_frame(
+            df_roll_all.assign(Orderlist=df_roll_all["Orderlist_Final"]),
+            "Orderlist", "Orderlist", "TrueShortQty_ALL", denom_orderlist_map_all
+        )
 
         # ---------- NC (line-based) restricted to selected orderlists ----------
         nc_allowed = {x.strip().lower() for x in args.nc_orderlists.split(";") if x.strip()}
-        ordlist_lower = df["Orderlist_Final"].astype("string").str.strip().str.lower()
-        nc_mask = ordlist_lower.isin(nc_allowed)
+        ordlist_lower_all = df["Orderlist_Final"].astype("string").str.strip().str.lower()
+        nc_mask = ordlist_lower_all.isin(nc_allowed)
         df_nc = df.loc[nc_mask].copy()
 
         branch = (
@@ -552,22 +558,22 @@ def main():
             else:
                 mis_summary = pd.DataFrame(columns=["lines"])
 
-        # DNS Top Reasons (WH-only, matched, not substituted)
+        # DNS Top Reasons (WH-only, matched, not substituted) — from frozen wh frame
         top_dns = pd.DataFrame()
-        wh_dns_mask = (roll_mask_wh.to_numpy())
-        wh_dns = df.loc[wh_dns_mask, "doNotStockReason_Final"].astype("string").str.strip().str.lower()
-        wh_dns = wh_dns[(wh_dns.notna()) & (wh_dns!="") & (~wh_dns.isin({"0","na","n/a","none","null","nan","-","--","."}))]
-        if not wh_dns.empty:
-            top_dns = wh_dns.value_counts().reset_index()
-            top_dns.columns = ["doNotStockReason","lines"]
+        if not df_roll_wh.empty:
+            wh_dns = df_roll_wh["doNotStockReason_Final"].astype("string").str.strip().str.lower()
+            wh_dns = wh_dns[(wh_dns.notna()) & (wh_dns!="") & (~wh_dns.isin({"0","na","n/a","none","null","nan","-","--","."}))]
+            if not wh_dns.empty:
+                top_dns = wh_dns.value_counts().reset_index()
+                top_dns.columns = ["doNotStockReason","lines"]
 
-        # Diagnostics
+        # Diagnostics (add a couple to sanity check frozen frames)
         diag = {
             "rows_total": int(len(df)),
             "rows_completed": int(df["_IsCompleted"].sum()),
             "rows_non_completed": int((~df["_IsCompleted"]).sum()),
             "warehouse_rows": int(wh_sorted.sum()),
-            "warehouse_rows_matched": int((wh_sorted & prodmatch_sort).sum()),
+            "warehouse_rows_matched": int((wh_sorted & pd.Series(df["_ProductMatched"].values, index=df.index)).sum()),
             "substituted_rows": int(df["_IsSubstituted"].sum()),
             "base_short_lines": int((df["_Short"]>0).sum()),
             "base_short_qty": float(df.loc[df["_Short"]>0, "_Short"].sum()),
@@ -575,11 +581,13 @@ def main():
             "final_true_short_qty_WH": float(df["TrueShortQty_WH"].sum()),
             "final_true_short_lines_ALL": int((df["TrueShortQty_ALL"]>0).sum()),
             "final_true_short_qty_ALL": float(df["TrueShortQty_ALL"].sum()),
+            "warehouse_roll_rows": int(len(df_roll_wh)),
+            "orderlist_all_roll_rows": int(len(df_roll_all)),
         }
         diag_df = pd.DataFrame([{"metric": k, "value": v} for k,v in diag.items()])
 
-        # Top Short Lines (WH-only, matched, not substituted)
-        mask_top = (roll_mask_wh.to_numpy()) & (df["TrueShortQty_WH"] > 0)
+        # Top Short Lines (WH-only, matched, not substituted) — using frozen wh frame
+        mask_top = (df_roll_wh["TrueShortQty_WH"] > 0)
         cols = [
             oc["branch"], oc["completed"], oc["orderno"], oc["orderlist"],
             oc["suppliername"], oc["pipcode"], oc["req"], oc["ord"], oc["delv"],
@@ -588,33 +596,33 @@ def main():
         ]
         if oc["department"]: cols.insert(4, oc["department"])
         if oc["groupname"]:  cols.insert(6, oc["groupname"])
-        cols = [c for c in cols if c]
-        top = df.loc[mask_top, cols].copy()
+        cols = [c for c in cols if c and c in df_roll_wh.columns]
+        top = df_roll_wh.loc[mask_top, cols].copy()
         rename_map = {}
-        if oc["branch"]:        rename_map[oc["branch"]]        = "Branch"
-        if oc["completed"]:     rename_map[oc["completed"]]     = "Completed Date"
-        if oc["orderno"]:       rename_map[oc["orderno"]]       = "Branch Order No."
-        if oc["orderlist"]:     rename_map[oc["orderlist"]]     = "Orderlist (Raw)"
-        if oc["department"]:    rename_map[oc["department"]]    = "Department (Raw)"
-        if oc["suppliername"]:  rename_map[oc["suppliername"]]  = "SupplierName (Raw)"
-        if oc["groupname"]:     rename_map[oc["groupname"]]     = "Group (Raw)"
-        if oc["pipcode"]:       rename_map[oc["pipcode"]]       = "PIPCode"
-        if oc["req"] :          rename_map[oc["req"]]           = "Req Qty (capped)"
-        if oc["ord"] :          rename_map[oc["ord"]]           = "Order Qty"
-        if oc["delv"]:          rename_map[oc["delv"]]          = "Deliver Qty"
+        if oc["branch"] in top.columns:        rename_map[oc["branch"]]        = "Branch"
+        if oc["completed"] in top.columns:     rename_map[oc["completed"]]     = "Completed Date"
+        if oc["orderno"] in top.columns:       rename_map[oc["orderno"]]       = "Branch Order No."
+        if oc["orderlist"] in top.columns:     rename_map[oc["orderlist"]]     = "Orderlist (Raw)"
+        if oc["department"] in top.columns:    rename_map[oc["department"]]    = "Department (Raw)"
+        if oc["suppliername"] in top.columns:  rename_map[oc["suppliername"]]  = "SupplierName (Raw)"
+        if oc["groupname"] in top.columns:     rename_map[oc["groupname"]]     = "Group (Raw)"
+        if oc["pipcode"] in top.columns:       rename_map[oc["pipcode"]]       = "PIPCode"
+        if oc["req"] in top.columns:           rename_map[oc["req"]]           = "Req Qty (capped)"
+        if oc["ord"] in top.columns:           rename_map[oc["ord"]]           = "Order Qty"
+        if oc["delv"] in top.columns:          rename_map[oc["delv"]]          = "Deliver Qty"
         top = top.rename(columns=rename_map).sort_values(by="TrueShortQty_WH", ascending=False)
 
-        # Top Short PIPs (WH-only, matched, not substituted) with description/pack for ID
+        # Top Short PIPs (WH-only, matched, not substituted) — frozen wh frame
         pip_col = oc["pipcode"]
-        if pip_col:
-            df_top = df.loc[mask_top]
+        if (pip_col in df_roll_wh.columns):
+            df_top = df_roll_wh.loc[mask_top]
             desc_col = prod_desc if (prod_desc and prod_desc in df_top.columns) else find_col(df_top, CANDIDATES["desc"])
             pack_col = prod_pack if (prod_pack and prod_pack in df_top.columns) else find_col(df_top, CANDIDATES["pack"])
             agg_dict = {
                 "true_short_qty": ("TrueShortQty_WH","sum"),
                 "true_short_lines": ("TrueShortQty_WH", lambda s: (s>0).sum()),
             }
-            if oc["branch"]:
+            if oc["branch"] in df_top.columns:
                 agg_dict["branches_involved"] = (oc["branch"], pd.Series.nunique)
             if desc_col:
                 agg_dict["Product_Description"] = (desc_col, lambda s: s.dropna().astype(str).iloc[0] if s.dropna().size else "")
@@ -649,16 +657,16 @@ def main():
         log(f"Writing Excel: {out_final}")
         with pd.ExcelWriter(out_final, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as xw:
             sheets = [
-                ("Dept_Shortage", r_dep),                # WH only, matched, no subs
-                ("Supplier_Shortage", r_sup),            # WH only, matched, no subs
-                ("Group_Shortage", r_grp),               # WH only, matched, no subs
-                ("Orderlist_Shortage", r_ord),           # ALL routes, no subs
-                ("Top_Short_PIPs", pip_agg),             # WH only, matched
-                ("Top_Short_Lines", top),                # WH only, matched
+                ("Dept_Shortage", r_dep),                # WH only, matched, no subs (frozen)
+                ("Supplier_Shortage", r_sup),            # WH only, matched, no subs (frozen)
+                ("Group_Shortage", r_grp),               # WH only, matched, no subs (frozen)
+                ("Orderlist_Shortage", r_ord),           # ALL routes, no subs (frozen)
+                ("Top_Short_PIPs", pip_agg),             # WH only, matched (frozen)
+                ("Top_Short_Lines", top),                # WH only, matched (frozen)
                 ("Mismatch_Detail", mis_detail),
                 ("Mismatch_Summary", mis_summary),
-                ("Branch_NC", branch),
-                ("Company_NC", company),
+                ("Branch_NC", branch),                   # NC-limited
+                ("Company_NC", company),                 # NC-limited
                 ("DNS_Top_Reasons", top_dns),
                 ("Orders_Enriched", df),
                 ("Diagnostics", pd.DataFrame([{"metric": k, "value": v} for k,v in diag.items()])),
