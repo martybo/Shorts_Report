@@ -14,7 +14,7 @@ for /F %%T in ('powershell -NoProfile -Command "$([DateTime]::Now.ToString('yyyy
 REM Run
 set "WAREHOUSE_LIST=Warehouse;Warehouse Controlled Drugs;Warehouse - CD Products"
 
-py -3 warehouse_shortage_report_v1_nc.py ^
+py -3 warehouse_shortage_report_v1_nc_frozen.py ^
   --orders "Orders Report Generator.csv" ^
   --product-list "ExportFullProductList.csv" ^
   --subs "Substitutions.csv" ^
