@@ -14,11 +14,12 @@ for /F %%T in ('powershell -NoProfile -Command "$([DateTime]::Now.ToString('yyyy
 REM Run
 set "WAREHOUSE_LIST=Warehouse;Warehouse Controlled Drugs;Warehouse - CD Products"
 
-py -3 warehouse_shortage_report.py ^
+py -3 warehouse_shortage_report_v1_nc.py ^
   --orders "Orders Report Generator.csv" ^
   --product-list "ExportFullProductList.csv" ^
   --subs "Substitutions.csv" ^
-  --warehouse-orderlists "%WAREHOUSE_LIST%" ^
+  --warehouse-orderlists "Warehouse;Warehouse Controlled Drugs;Warehouse - CD Products" ^
+  --nc-orderlists "Supplier;Testers Perfume;Warehouse;Warehouse - CD Products;Xmas Warehouse;Perfumes;AAH (H&B);PHOENIX;YANKEE" ^
   --out "output\Shortage_Report.xlsx"
 
 echo ExitCode=%ERRORLEVEL%
