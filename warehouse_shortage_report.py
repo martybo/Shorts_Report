@@ -84,8 +84,8 @@ def apply_formats(writer, sheet_name, df):
 
 def add_share_and_rate(df, qty_col, denom_col):
     if df.empty:
-        df[qty_col + "_pct"] = []
-        df["shortage_rate_pct"] = []
+        df[qty_col + "_pct"] = pd.Series(dtype=float)
+        df["shortage_rate_pct"] = pd.Series(dtype=float)
         return df
     total_qty = float(df[qty_col].sum())
     df[qty_col + "_pct"] = (df[qty_col] / total_qty) if total_qty else 0.0
@@ -196,24 +196,52 @@ def main():
 
         # ---- VLOOKUP merge ----
         log("Merging orders with product list...")
-        merged = orders.merge(prod_clean, how="left", left_on=oc["pipcode"], right_on=pc_key, suffixes=("","__prod"))
-        merged["_ProductMatched"] = merged[pc_key].notna()
+        merged = orders.merge(
+            prod_clean,
+            how="left",
+            left_on=oc["pipcode"],
+            right_on=pc_key,
+            suffixes=("", "__prod"),
+            indicator="_merge",
+        )
+        merged["_ProductMatched"] = merged["_merge"].ne("left_only")
+        merged.drop(columns=["_merge"], inplace=True)
+
+        def merged_prod_col(col_name):
+            if not col_name:
+                return None
+            prod_col = f"{col_name}__prod"
+            if prod_col in merged.columns:
+                return prod_col
+            return col_name if col_name in merged.columns else None
+
+        def string_series(col_name):
+            if col_name and col_name in merged.columns:
+                return merged[col_name].astype("string")
+            return pd.Series("", index=merged.index, dtype="string")
+
+        prod_dep_col  = merged_prod_col(prod_dep)
+        prod_sup_col  = merged_prod_col(prod_sup)
+        prod_grp_col  = merged_prod_col(prod_grp)
+        prod_ordl_col = merged_prod_col(prod_ordl)
+        prod_dns_col  = merged_prod_col(prod_dns)
+        prod_maxo_col = merged_prod_col(prod_maxo)
+        prod_desc_col = merged_prod_col(prod_desc)
+        prod_pack_col = merged_prod_col(prod_pack)
 
         # finals for dims
-        merged["Department_Final"] = coalesce(merged[oc["department"]] if oc["department"] else pd.Series("", index=merged.index, dtype="string"),
-                                              merged[prod_dep] if prod_dep else pd.Series("", index=merged.index, dtype="string"))
-        merged["Group_Final"]      = coalesce(merged[oc["groupname"]] if oc["groupname"] else pd.Series("", index=merged.index, dtype="string"),
-                                              merged[prod_grp] if prod_grp else pd.Series("", index=merged.index, dtype="string"))
+        merged["Department_Final"] = coalesce(string_series(oc["department"]), string_series(prod_dep_col))
+        merged["Group_Final"] = coalesce(string_series(oc["groupname"]), string_series(prod_grp_col))
 
         # Orderlist: prefer Orders.Supplier (route), else Product.Orderlist
-        orders_orderlist   = merged[oc["orderlist"]].astype("string") if oc["orderlist"] else pd.Series("", index=merged.index, dtype="string")
-        product_orderlist  = merged[prod_ordl].astype("string") if prod_ordl else pd.Series("", index=merged.index, dtype="string")
+        orders_orderlist = string_series(oc["orderlist"])
+        product_orderlist = string_series(prod_ordl_col)
         merged["Orderlist_Final"] = coalesce(orders_orderlist, product_orderlist)
 
         # SupplierName_Final = Product supplierName unless Orders suppliername is distinct from orderlist
         use_orders_supplier = oc["suppliername"] and (oc["suppliername"] != oc["orderlist"])
-        orders_sup_series   = merged[oc["suppliername"]].astype("string") if use_orders_supplier else pd.Series("", index=merged.index, dtype="string")
-        product_sup_series  = merged[prod_sup].astype("string") if prod_sup else pd.Series("", index=merged.index, dtype="string")
+        orders_sup_series = string_series(oc["suppliername"]) if use_orders_supplier else string_series(None)
+        product_sup_series = string_series(prod_sup_col)
         merged["SupplierName_Final"] = coalesce(orders_sup_series, product_sup_series)
 
         # dates & completion
@@ -225,8 +253,10 @@ def main():
         _req_raw = ensure_numeric(merged[oc["req"]]) if oc["req"] else pd.Series(0, index=merged.index)
         _ord     = ensure_numeric(merged[oc["ord"]]) if oc["ord"] else pd.Series(0, index=merged.index)
         _del     = ensure_numeric(merged[oc["delv"]]) if oc["delv"] else pd.Series(0, index=merged.index)
-        maxo = (ensure_numeric(merged[oc["maxord"]]) if oc["maxord"] and oc["maxord"] in merged.columns
-                else (ensure_numeric(merged[prod_maxo]) if prod_maxo else pd.Series(0, index=merged.index)))
+        if oc["maxord"] and oc["maxord"] in merged.columns:
+            maxo = ensure_numeric(merged[oc["maxord"]])
+        else:
+            maxo = ensure_numeric(merged[prod_maxo_col]) if prod_maxo_col else pd.Series(0, index=merged.index)
         _req = np.where(maxo > 0, np.minimum(_req_raw, maxo), _req_raw)
         merged["_Req"] = pd.Series(_req, index=merged.index)
         merged["_Ord"] = _ord
@@ -238,8 +268,8 @@ def main():
         merged["_Short"]  = (merged["_Req"] - merged["_EffDel"]).clip(lower=0)
 
         # DNS consolidated
-        orders_dns  = merged[oc["dns"]].astype("string") if oc["dns"] else pd.Series("", index=merged.index, dtype="string")
-        product_dns = merged[prod_dns].astype("string") if prod_dns else pd.Series("", index=merged.index, dtype="string")
+        orders_dns  = string_series(oc["dns"])
+        product_dns = string_series(prod_dns_col)
         if args.dns_source == "orders":
             merged["doNotStockReason_Final"] = orders_dns
         elif args.dns_source == "both":
@@ -258,8 +288,8 @@ def main():
             subs_keys = _make_key(subs_df[subs_desc_col], subs_df[subs_pack_col])
             subs_key_set = set(subs_keys.unique())
 
-            desc_prod_col = prod_desc if (prod_desc and prod_desc in merged.columns) else None
-            pack_prod_col = prod_pack if (prod_pack and prod_pack in merged.columns) else None
+            desc_prod_col = prod_desc_col
+            pack_prod_col = prod_pack_col
             if desc_prod_col and pack_prod_col:
                 orders_keys = _make_key(merged[desc_prod_col], merged[pack_prod_col])
             else:
@@ -269,7 +299,7 @@ def main():
                 if ord_pack_col == "_blank_pack2": merged["_blank_pack2"] = ""
                 orders_keys = _make_key(merged[ord_desc_col], merged[ord_pack_col])
             # Heuristic: substituted lines have Order Qty == 0 in the warehouse system
-            is_sub = orders_keys.isin(subs_key_set) & (merged[oc["ord"]] == 0)
+            is_sub = orders_keys.isin(subs_key_set) & (merged["_Ord"] == 0)
         merged["_IsSubstituted"] = is_sub
 
         # ---------------- masks & sorting ----------------
@@ -616,8 +646,8 @@ def main():
         pip_col = oc["pipcode"]
         if (pip_col in df_roll_wh.columns):
             df_top = df_roll_wh.loc[mask_top]
-            desc_col = prod_desc if (prod_desc and prod_desc in df_top.columns) else find_col(df_top, CANDIDATES["desc"])
-            pack_col = prod_pack if (prod_pack and prod_pack in df_top.columns) else find_col(df_top, CANDIDATES["pack"])
+            desc_col = prod_desc_col if (prod_desc_col and prod_desc_col in df_top.columns) else find_col(df_top, CANDIDATES["desc"])
+            pack_col = prod_pack_col if (prod_pack_col and prod_pack_col in df_top.columns) else find_col(df_top, CANDIDATES["pack"])
             agg_dict = {
                 "true_short_qty": ("TrueShortQty_WH","sum"),
                 "true_short_lines": ("TrueShortQty_WH", lambda s: (s>0).sum()),
@@ -669,7 +699,7 @@ def main():
                 ("Company_NC", company),                 # NC-limited
                 ("DNS_Top_Reasons", top_dns),
                 ("Orders_Enriched", df),
-                ("Diagnostics", pd.DataFrame([{"metric": k, "value": v} for k,v in diag.items()])),
+                ("Diagnostics", diag_df),
             ]
             for name, data in sheets:
                 data.to_excel(xw, index=False, sheet_name=name)

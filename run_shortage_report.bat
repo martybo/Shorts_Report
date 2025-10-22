@@ -24,9 +24,10 @@ REM === Inputs (edit if you use different filenames) ===
 set "ORDERS=Orders Report Generator.csv"
 set "PRODUCT=ExportFullProductList.csv"
 set "SUBS=Substitutions.csv"
+set "SUBS_LABEL=%SUBS%"
 
 REM === Script name (edit if you saved with a different filename) ===
-set "SCRIPT=warehouse_shortage_report_v1_nc_frozen.py"
+set "SCRIPT=warehouse_shortage_report.py"
 
 REM === Warehouse orderlists for Dept/Supplier/Group summaries ===
 set "WH_LIST=Warehouse;Warehouse Controlled Drugs;Warehouse - CD Products"
@@ -38,7 +39,7 @@ echo ===============================================================
 echo  TRUE Shortage Report - Run %DATE% %TIME%
 echo  CWD  : %CD%
 echo  PY   : %PYEXE%
-echo  IN   : "%ORDERS%" + "%PRODUCT%" + "%SUBS%"
+echo  IN   : "%ORDERS%" + "%PRODUCT%" + "%SUBS_LABEL%"
 echo  OUT  : output\Shortage_Report_*.xlsx  (final name auto-suffixed with _wcDDMMYY)
 echo ===============================================================
 echo.
@@ -62,12 +63,15 @@ REM Substitutions are optional; warn if missing
 if not exist "%SUBS%" (
   echo [WARN] Substitutions file not found ("%SUBS%") - continuing without substitutions.
   set "SUBS_ARG="
+  set "SUBS_LABEL=(none)"
 ) else (
   set "SUBS_ARG=--subs "%SUBS%""
 )
 
 REM === Build command (script handles naming & _wcDDMMYY) ===
-set "CMD=%PYEXE% "%SCRIPT%" --orders "%ORDERS%" --product-list "%PRODUCT%" %SUBS_ARG% --warehouse-orderlists "%WH_LIST%" --nc-orderlists "%NC_LIST%" --out "output\Shortage_Report.xlsx""
+set "CMD=%PYEXE% "%SCRIPT%" --orders "%ORDERS%" --product-list "%PRODUCT%""
+if defined SUBS_ARG set "CMD=%CMD% %SUBS_ARG%"
+set "CMD=%CMD% --warehouse-orderlists "%WH_LIST%" --nc-orderlists "%NC_LIST%" --out "output\Shortage_Report.xlsx""
 
 echo Running:
 echo %CMD%
