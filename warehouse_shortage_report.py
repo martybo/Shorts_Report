@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, sys, re, pandas as pd, numpy as np
+import argparse, sys, re, pandas as pd, numpy as np, unicodedata
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -99,16 +99,29 @@ def coalesce(a, b):
     pick_a = a.str.strip().ne("") & a.notna()
     return a.where(pick_a, b)
 
-# concat key for substitutions
-def concat_key(desc_series, pack_series):
-    d = desc_series.astype("string").fillna("").str.strip().str.lower()
-    p = pack_series.astype("string").fillna("").str.strip().str.lower()
-    return d + " | " + p
+# robust normalizers for substitutions
+def _norm_text(series: pd.Series) -> pd.Series:
+    s = series.astype("string").fillna("")
+    s = s.map(lambda x: unicodedata.normalize("NFKC", x))
+    s = s.str.strip().str.replace(r"\s+", " ", regex=True).str.lower()
+    return s
+
+def _norm_pack(series: pd.Series) -> pd.Series:
+    raw = series.astype("string")
+    num = pd.to_numeric(raw.str.replace(",", "").str.extract(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*$", expand=False), errors="coerce")
+    num_str = num.map(lambda v: (f"{int(v)}" if pd.notna(v) and abs(v - int(v)) < 1e-9 else (f"{v:.3f}".rstrip("0").rstrip(".") if pd.notna(v) else np.nan)))
+    out = num_str.astype("string")
+    mask_non = out.isna() | (out.str.strip() == "nan")
+    out = out.where(~mask_non, _norm_text(raw)).fillna("").str.strip()
+    return out
+
+def _make_key(desc_ser: pd.Series, pack_ser: pd.Series) -> pd.Series:
+    return _norm_text(desc_ser) + " | " + _norm_pack(pack_ser)
 
 # ------------------------ main -----------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="TRUE shortage report (includes non-completed with OrderQty-as-delivery, substitution exclusion by ProductName+PackSize, WH-only vs ALL routes, reset-on-success, product-match gating, PIP leaderboard, audit columns)."
+        description="TRUE shortage report with Warehouse-only summaries, ALL-routes orderlist view, substitution exclusion, reset-on-success, NC limited to specified orderlists, earliest-date _wcDDMMYY naming."
     )
     ap.add_argument("--orders", required=True, help="Orders CSV/XLSX")
     ap.add_argument("--product-list", required=True, help="Product list CSV/XLSX")
@@ -129,8 +142,15 @@ def main():
     # warehouse orderlists (future-proof)
     ap.add_argument(
         "--warehouse-orderlists",
-        default="Warehouse;Warehouse Controlled Drugs;Warehouse - CD Products;Perfumes",
+        default="Warehouse;Warehouse Controlled Drugs;Warehouse - CD Products",
         help="Semicolon-separated list of orderlist names treated as Warehouse (case-insensitive)."
+    )
+
+    # NC orderlists filter (your new requirement)
+    ap.add_argument(
+        "--nc-orderlists",
+        default="Supplier;Testers Perfume;Warehouse;Warehouse - CD Products;Xmas Warehouse;Perfumes;AAH (H&B);PHOENIX;YANKEE",
+        help="Semicolon-separated orderlist names to include in Branch_NC/Company_NC (case-insensitive)."
     )
 
     args = ap.parse_args()
@@ -190,7 +210,7 @@ def main():
         product_orderlist  = merged[prod_ordl].astype("string") if prod_ordl else pd.Series("", index=merged.index, dtype="string")
         merged["Orderlist_Final"] = coalesce(orders_orderlist, product_orderlist)
 
-        # SupplierName_Final = Product supplierName, unless Orders suppliername is distinct from orderlist
+        # SupplierName_Final = Product supplierName unless Orders suppliername is distinct from orderlist
         use_orders_supplier = oc["suppliername"] and (oc["suppliername"] != oc["orderlist"])
         orders_sup_series   = merged[oc["suppliername"]].astype("string") if use_orders_supplier else pd.Series("", index=merged.index, dtype="string")
         product_sup_series  = merged[prod_sup].astype("string") if prod_sup else pd.Series("", index=merged.index, dtype="string")
@@ -228,51 +248,16 @@ def main():
             merged["doNotStockReason_Final"] = product_dns
 
         # ---------------- substitutions: by ProductName+PackSize (robust) ----------------
-        import unicodedata
-        
-        def _norm_text(series: pd.Series) -> pd.Series:
-            # Unicode normalize, strip, collapse whitespace, lowercase
-            s = series.astype("string").fillna("")
-            s = s.map(lambda x: unicodedata.normalize("NFKC", x))
-            s = s.str.strip()
-            s = s.str.replace(r"\s+", " ", regex=True)
-            s = s.str.lower()
-            return s
-        
-        def _norm_pack(series: pd.Series) -> pd.Series:
-            # Try to coerce pure numerics to integer-like strings (20.0 -> "20"); else fall back to text normalisation
-            raw = series.astype("string")
-            # Attempt numeric parse (handles "20", "20.0"); leave non-numeric as NaN
-            num = pd.to_numeric(raw.str.replace(",", "").str.extract(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*$", expand=False), errors="coerce")
-            num_str = num.map(lambda v: (f"{int(v)}" if pd.notna(v) and abs(v - int(v)) < 1e-9 else (f"{v:.3f}".rstrip("0").rstrip(".") if pd.notna(v) else np.nan)))
-            out = num_str.astype("string")
-            # Where numeric coercion failed, normalise as text
-            mask_non = out.isna() | (out.str.strip() == "nan")
-            out = out.where(~mask_non, _norm_text(raw))
-            # Final tidy
-            out = out.fillna("").str.strip()
-            return out
-        
-        def _make_key(desc_ser: pd.Series, pack_ser: pd.Series) -> pd.Series:
-            return _norm_text(desc_ser) + " | " + _norm_pack(pack_ser)
-        
         is_sub = pd.Series(False, index=merged.index)
-        subs_key_set = set()
-        
-        if subs_df is not None and not subs_df.empty:
-            # Column detection for substitutions
+        if args.subs and subs_df is not None and not subs_df.empty:
             subs_desc_col = args.subs_desc_col or find_col(subs_df, CANDIDATES["desc"]) or subs_df.columns[0]
             subs_pack_col = args.subs_pack_col or find_col(subs_df, CANDIDATES["pack"])
             if not subs_pack_col:
                 subs_df["_blank_pack"] = ""
                 subs_pack_col = "_blank_pack"
-        
-            # Build the canonical key set from substitutions
             subs_keys = _make_key(subs_df[subs_desc_col], subs_df[subs_pack_col])
             subs_key_set = set(subs_keys.unique())
-        
-            # Build Orders-side keys:
-            # Prefer product description/packSize from the joined product table; else fall back to orders-side fields.
+
             desc_prod_col = prod_desc if (prod_desc and prod_desc in merged.columns) else None
             pack_prod_col = prod_pack if (prod_pack and prod_pack in merged.columns) else None
             if desc_prod_col and pack_prod_col:
@@ -283,24 +268,17 @@ def main():
                 ord_pack_col = find_col(merged, CANDIDATES["pack"]) or "_blank_pack2"
                 if ord_pack_col == "_blank_pack2": merged["_blank_pack2"] = ""
                 orders_keys = _make_key(merged[ord_desc_col], merged[ord_pack_col])
-        
-            # Heuristic: warehouse system sets Order Qty = 0 for substituted lines.
-            # We match keys *and* require the numeric Order Qty == 0 to be safe.  Using
-            # the normalised `_Ord` column avoids KeyError when the raw column is
-            # absent and keeps the comparison in numeric space.
-            ord_qty = merged["_Ord"].fillna(0)
-            is_sub = orders_keys.isin(subs_key_set) & (ord_qty == 0)
-        
+            # Heuristic: substituted lines have Order Qty == 0 in the warehouse system
+            is_sub = orders_keys.isin(subs_key_set) & (merged[oc["ord"]] == 0)
         merged["_IsSubstituted"] = is_sub
 
-        # ---------------- masks ----------------
+        # ---------------- masks & sorting ----------------
         dns_mask = dns_present(merged["doNotStockReason_Final"])          # True means has DNS (exclude)
         metric_mask = merged["_IsCompleted"] if args.completed_only else pd.Series(True, index=merged.index)
 
-        # ---------------- Rule 3 (reset-on-success) ----------------
         br, pip, orderno = oc["branch"], oc["pipcode"], oc["orderno"]
         if not br or not pip: raise KeyError("Missing Branch or PIPCode for Rule 3.")
-        sort_cols = [br, pip]; 
+        sort_cols = [br, pip]
         if orderno: sort_cols.append(orderno)
         sort_cols.append("_Completed")
         df = merged.sort_values(by=sort_cols).copy()
@@ -330,30 +308,24 @@ def main():
 
         reset_on_success = not args.no_reset_on_success
 
-        # dual tracks: WH-only (product-matched) and ALL routes
+        # dual tracks: WH-only (for dept/supplier/group) and ALL routes (for orderlist)
         inc_wh  = np.zeros(len(df), dtype=float)
         inc_all = np.zeros(len(df), dtype=float)
         hist_max_wh  = {}
         hist_max_all = {}
 
-        # denominators (dedup req per window)
-        denom_dep = defaultdict(float)   # WH-only (exclude non-matched)
-        denom_sup = defaultdict(float)
-        denom_grp = defaultdict(float)
-        denom_ord_wh  = defaultdict(float)  # WH-only
-        denom_ord_all = defaultdict(float)  # ALL routes
+        # denominators (dedup req per window) – WH and ALL
+        dedup_req_attributed = np.zeros(len(df), dtype=float)      # WH per-row attribution
+        dedup_req_attributed_all = np.zeros(len(df), dtype=float)  # ALL routes per-row attribution
 
-        # audit (which row got the dedup req for the closed window)
         window_id = np.zeros(len(df), dtype=int)
         window_seq = np.zeros(len(df), dtype=int)
-        dedup_req_attributed = np.zeros(len(df), dtype=float)  # used for WH attribution
-        dedup_req_attributed_all = np.zeros(len(df), dtype=float)  # NEW: ALL orderlists attribution
         window_max_req_echo = np.zeros(len(df), dtype=float)
         denom_key_dep = np.empty(len(df), dtype=object)
         denom_key_sup = np.empty(len(df), dtype=object)
         denom_key_grp = np.empty(len(df), dtype=object)
-        denom_key_ord = np.empty(len(df), dtype=object)        # WH-only attribution
-        denom_key_orderlist_all = np.empty(len(df), dtype=object)  # ALL-routes attribution
+        denom_key_ord = np.empty(len(df), dtype=object)              # WH attribution
+        denom_key_orderlist_all = np.empty(len(df), dtype=object)    # ALL routes
 
         state_wh  = {}
         state_all = {}
@@ -371,23 +343,19 @@ def main():
                     denom_key_sup[idx_attr] = st["last_sup"]
                     denom_key_grp[idx_attr] = st["last_grp"]
                     denom_key_ord[idx_attr] = st["last_ord"]
-                if st["last_dep"] is not None: denom_dep[st["last_dep"]] += w
-                if st["last_sup"] is not None: denom_sup[st["last_sup"]] += w
-                if st["last_grp"] is not None: denom_grp[st["last_grp"]] += w
-                if st["last_ord"] is not None: denom_ord_wh[st["last_ord"]] += w
             st["window_max_req"] = 0.0
             st["open"] = False
             return st
 
         def push_window_all(key, st, final_row_idx=None):
+            """Close ALL-routes window; add to ALL orderlist denominator."""
             if not st: return st
             w = st["window_max_req"]
             if w > 0 and st["last_ord"] is not None:
                 idx_attr = final_row_idx if final_row_idx is not None else st.get("last_row_idx")
                 if idx_attr is not None:
                     denom_key_orderlist_all[idx_attr] = st["last_ord"]
-                    dedup_req_attributed_all[idx_attr] = w           # <-- NEW: store amount for ALL path
-                denom_ord_all[st["last_ord"]] += w
+                    dedup_req_attributed_all[idx_attr] = w
             st["window_max_req"] = 0.0
             st["open"] = False
             return st
@@ -407,7 +375,7 @@ def main():
         ):
             key = (b, pp)
 
-            # Substituted rows are neutral: they don't affect windows, denominators, or shortages.
+            # Substituted rows are neutral for shortages/denominators.
             if is_subbed:
                 inc_wh[i] = 0.0; inc_all[i] = 0.0
                 continue
@@ -468,7 +436,7 @@ def main():
                 inc_all[i] = 0.0
             state_all[key] = sta
 
-        # close any open windows
+        # close open windows
         for key, stw in list(state_wh.items()):
             if stw.get("open", False): push_window_wh(key, stw, final_row_idx=stw.get("last_row_idx"))
         for key, sta in list(state_all.items()):
@@ -481,11 +449,12 @@ def main():
         df["window_seq_incr"] = window_seq
         df["window_max_req"] = window_max_req_echo
         df["dedup_req_attributed"] = dedup_req_attributed
+        df["dedup_req_attributed_all"] = dedup_req_attributed_all
         df["denom_key_department"] = pd.Series(denom_key_dep, index=df.index)
         df["denom_key_supplier"]   = pd.Series(denom_key_sup, index=df.index)
         df["denom_key_group"]      = pd.Series(denom_key_grp, index=df.index)
-        df["denom_key_orderlist"]  = pd.Series(denom_key_ord, index=df.index)              # WH attribution
-        df["denom_key_orderlist_all"] = pd.Series(denom_key_orderlist_all, index=df.index) # ALL attribution
+        df["denom_key_orderlist"]  = pd.Series(denom_key_ord, index=df.index)               # WH attribution
+        df["denom_key_orderlist_all"] = pd.Series(denom_key_orderlist_all, index=df.index)  # ALL routes
         df["_ProductMatched"] = prodmatch_sort.to_numpy()
         df["_IsSubstituted"] = sub_sorted.to_numpy()
         df["_Effective_Delivery_Used"] = df["_EffDel"]
@@ -506,8 +475,8 @@ def main():
         denom_sup = denom_from_keys(df["denom_key_supplier"],   df["dedup_req_attributed"])
         denom_grp = denom_from_keys(df["denom_key_group"],      df["dedup_req_attributed"])
 
-        # ALL routes denominators (use ALL orderlist key attribution)
-        denom_ord_all = denom_from_keys(df["denom_key_orderlist_all"], dedup_req_attributed_all)
+        # ALL routes denominators (use ALL orderlist per-row attributions)
+        denom_ord_all = denom_from_keys(df["denom_key_orderlist_all"], df["dedup_req_attributed_all"])
 
         # ---------- rollups ----------
         def rollup(mask, series, title, qty_col, denom_map):
@@ -539,26 +508,40 @@ def main():
         # Orderlist (ALL routes)
         r_ord = rollup(roll_mask_all, df["Orderlist_Final"], "Orderlist", "TrueShortQty_ALL", denom_ord_all)
 
-        # NC (line-based)
-        branch = df.groupby(oc["branch"], dropna=False).size().reset_index(name="total_lines")
-        non_completed = df.loc[~df["_IsCompleted"]].groupby(oc["branch"], dropna=False).size().reset_index(name="non_completed_lines")
-        branch = branch.merge(non_completed, on=oc["branch"], how="left").fillna({"non_completed_lines":0})
+        # ---------- NC (line-based) restricted to selected orderlists ----------
+        nc_allowed = {x.strip().lower() for x in args.nc_orderlists.split(";") if x.strip()}
+        ordlist_lower = df["Orderlist_Final"].astype("string").str.strip().str.lower()
+        nc_mask = ordlist_lower.isin(nc_allowed)
+        df_nc = df.loc[nc_mask].copy()
+
+        branch = (
+            df_nc.groupby(oc["branch"], dropna=False)
+                 .size().reset_index(name="total_lines")
+        )
+        non_completed = (
+            df_nc.loc[~df_nc["_IsCompleted"]]
+                 .groupby(oc["branch"], dropna=False)
+                 .size().reset_index(name="non_completed_lines")
+        )
+        branch = branch.merge(non_completed, on=oc["branch"], how="left").fillna({"non_completed_lines": 0})
         branch["non_completed_lines"] = branch["non_completed_lines"].astype(int)
-        branch["non_completed_pct"] = np.where(branch["total_lines"]>0,
-                                               branch["non_completed_lines"]/branch["total_lines"], 0.0)
+        branch["non_completed_pct"] = np.where(
+            branch["total_lines"] > 0,
+            branch["non_completed_lines"] / branch["total_lines"],
+            0.0
+        )
+
+        company_total = int(branch["total_lines"].sum())
+        company_nc    = int(branch["non_completed_lines"].sum())
         company = pd.DataFrame([{
-            "company_total_lines": int(branch["total_lines"].sum()),
-            "company_non_completed_lines": int(branch["non_completed_lines"].sum()),
-            "company_non_completed_pct": (branch["non_completed_lines"].sum()/branch["total_lines"].sum()) if branch["total_lines"].sum()>0 else 0.0
+            "company_total_lines": company_total,
+            "company_non_completed_lines": company_nc,
+            "company_non_completed_pct": (company_nc/company_total) if company_total>0 else 0.0
         }])
 
         # mismatch detail/summary
-        if oc["ord"] and oc["delv"]:
-            _ord2 = ensure_numeric(df[oc["ord"]])
-            _del2 = ensure_numeric(df[oc["delv"]])
-            mis_mask = (_ord2 != _del2)
-        else:
-            mis_mask = pd.Series(False, index=df.index)
+        _ord2 = ensure_numeric(df[oc["ord"]]); _del2 = ensure_numeric(df[oc["delv"]])
+        mis_mask = (_ord2 != _del2)
         cols_keep = [c for c in [oc["pipcode"], oc["department"], oc["branch"], oc["req"], oc["ord"], oc["delv"], oc["completed"]] if c]
         mis_detail = df.loc[mis_mask, cols_keep] if cols_keep else df.loc[mis_mask]
         if oc["pipcode"] and oc["department"] and oc["branch"]:
@@ -593,6 +576,8 @@ def main():
             "final_true_short_lines_ALL": int((df["TrueShortQty_ALL"]>0).sum()),
             "final_true_short_qty_ALL": float(df["TrueShortQty_ALL"].sum()),
         }
+        diag_df = pd.DataFrame([{"metric": k, "value": v} for k,v in diag.items()])
+
         # Top Short Lines (WH-only, matched, not substituted)
         mask_top = (roll_mask_wh.to_numpy()) & (df["TrueShortQty_WH"] > 0)
         cols = [
@@ -652,7 +637,6 @@ def main():
             wc_tag = f"wc{d0.day:02d}{d0.month:02d}{d0.year%100:02d}"
             base = out_path.with_suffix("").name
             parent = out_path.parent
-            # keep provided base name; just append wc tag if missing
             if not base.lower().endswith(f"_{wc_tag}"):
                 final_name = f"{base}_{wc_tag}.xlsx"
             else:
